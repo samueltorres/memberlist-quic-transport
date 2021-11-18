@@ -36,6 +36,7 @@ func echoServer() error {
 	if err != nil {
 		return err
 	}
+
 	sess, err := listener.Accept(context.Background())
 	if err != nil {
 		return err
