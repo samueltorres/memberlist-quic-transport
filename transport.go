@@ -3,12 +3,13 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/memberlist"
 	"github.com/lucas-clemente/quic-go"
@@ -25,18 +26,20 @@ type Config struct {
 	// Zero = no timeout
 	PacketDialTimeout time.Duration
 
-	// Timeout for writing packet data. Zero = no timeout.
-	PacketWriteTimeout time.Duration
-
 	// Transport logs lot of messages at debug level, so it deserves an extra flag for turning it on
 	TransportDebug bool
+
+	// Logger
+	Logger logr.Logger
 
 	// Quic TLS Configuration
 	TLS *tls.Config
 }
 
 type QuicTransport struct {
-	config      Config
+	config Config
+	logger logr.Logger
+
 	sessionPool *quicSessionPool
 	packetCh    chan *memberlist.Packet
 	connCh      chan net.Conn
@@ -50,13 +53,14 @@ type QuicTransport struct {
 
 func NewQuicTransport(config Config) (*QuicTransport, error) {
 	if len(config.BindAddrs) == 0 {
-		return nil, fmt.Errorf("At least one bind address is required")
+		return nil, errors.New("at least one bind address is required")
 	}
 
 	var ok bool
 	t := &QuicTransport{
-		sessionPool: newQuicSessionPool(config.TLS),
+		sessionPool: newQuicSessionPool(config.Logger, config.TLS),
 		config:      config,
+		logger:      config.Logger,
 		packetCh:    make(chan *memberlist.Packet),
 		connCh:      make(chan net.Conn),
 		listeners:   make([]quic.Listener, len(config.BindAddrs)),
@@ -79,7 +83,6 @@ func NewQuicTransport(config Config) (*QuicTransport, error) {
 		quicConfig := &quic.Config{
 			EnableDatagrams: true,
 			KeepAlive:       true,
-			TokenStore:      quic.NewLRUTokenStore(1000, 100),
 		}
 
 		listener, err := quic.ListenAddr(fmt.Sprintf("%s:%d", addr, port), config.TLS, quicConfig)
@@ -120,7 +123,7 @@ func (t *QuicTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, er
 		// If they've supplied an address, use that.
 		advertiseAddr = net.ParseIP(ip)
 		if advertiseAddr == nil {
-			return nil, 0, fmt.Errorf("Failed to parse advertise address %q", ip)
+			return nil, 0, fmt.Errorf("failed to parse advertise address")
 		}
 
 		// Ensure IPv4 conversion if necessary.
@@ -135,15 +138,15 @@ func (t *QuicTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, er
 			var err error
 			ip, err = sockaddr.GetPrivateIP()
 			if err != nil {
-				return nil, 0, fmt.Errorf("Failed to get interface addresses: %v", err)
+				return nil, 0, fmt.Errorf("failed to get interface addresses: %v", err)
 			}
 			if ip == "" {
-				return nil, 0, fmt.Errorf("No private IP address found, and explicit IP not provided")
+				return nil, 0, fmt.Errorf("no private IP address found, and explicit IP not provided")
 			}
 
 			advertiseAddr = net.ParseIP(ip)
 			if advertiseAddr == nil {
-				return nil, 0, fmt.Errorf("Failed to parse advertise address: %q", ip)
+				return nil, 0, fmt.Errorf("failed to parse advertise address: %q", ip)
 			}
 		} else {
 			// Use the IP that we're bound to, based on the first
@@ -177,21 +180,17 @@ func (t *QuicTransport) GetAutoBindPort() int {
 // string, similar to Dial, so it's network neutral, so this usually is
 // in the form of "host:port".
 func (t *QuicTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-	log.Println("writing to", addr)
-
 	a := memberlist.Address{Addr: addr, Name: ""}
 	return t.WriteToAddress(b, a)
 }
 
 func (t *QuicTransport) WriteToAddress(b []byte, addr memberlist.Address) (time.Time, error) {
-	// log.Println("writing to address", addr.Name, addr.Addr)
-	s, err := t.sessionPool.GetOrCreate(addr, t.config.PacketDialTimeout)
+	s, err := t.sessionPool.Get(t.ctx, addr, t.config.PacketDialTimeout)
 	if err != nil {
 		return time.Now(), err
 	}
 
 	err = s.SendMessage(b)
-
 	return time.Now(), err
 }
 
@@ -206,8 +205,7 @@ func (t *QuicTransport) DialTimeout(addr string, timeout time.Duration) (net.Con
 }
 
 func (t *QuicTransport) DialAddressTimeout(addr memberlist.Address, timeout time.Duration) (net.Conn, error) {
-	log.Println("calling dialaddress", addr.Addr)
-	session, err := t.sessionPool.GetOrCreate(addr, t.config.PacketDialTimeout)
+	session, err := t.sessionPool.Get(t.ctx, addr, t.config.PacketDialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +213,6 @@ func (t *QuicTransport) DialAddressTimeout(addr memberlist.Address, timeout time
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	log.Println("opening stream")
 	stream, err := session.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
@@ -253,11 +250,8 @@ func (t *QuicTransport) runListener(listener quic.Listener) error {
 
 		session, err := listener.Accept(context.Background())
 		if err != nil {
-			log.Println("error acception connection", err)
 			continue
 		}
-
-		log.Println("accepted connection from ", session.RemoteAddr())
 
 		t.listenerWg.Add(2)
 		go t.handleStream(session)
@@ -277,7 +271,6 @@ func (t *QuicTransport) handleStream(session quic.Session) {
 
 		stream, err := session.AcceptStream(t.ctx)
 		if err != nil {
-			log.Println("could not accept unitstream", err)
 			return
 		}
 
@@ -297,12 +290,7 @@ func (t *QuicTransport) handleDatagrams(session quic.Session) {
 
 		msg, err := session.ReceiveMessage()
 		if err != nil {
-			log.Println("error receiving datagram :", err)
 			return
-		}
-
-		if len(msg) < 1 {
-			log.Println("empty datagram")
 		}
 
 		t.packetCh <- &memberlist.Packet{
