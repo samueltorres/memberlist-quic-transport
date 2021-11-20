@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"log"
 	"net"
 	"time"
 
@@ -13,32 +14,50 @@ type quicConn struct {
 	raddr net.Addr
 }
 
-func newQuicConn(session quic.Session, stream quic.Stream) (*quicConn, error) {
+func newQuicConn(session quic.Session, stream quic.Stream) *quicConn {
 	return &quicConn{
 		s:     stream,
 		laddr: session.LocalAddr(),
 		raddr: session.RemoteAddr(),
-	}, nil
+	}
 }
 
 // Read reads data from the connection.
 // Read can be made to time out and return an error after a fixed
 // time limit; see SetDeadline and SetReadDeadline.
 func (c *quicConn) Read(b []byte) (n int, err error) {
-	return c.s.Read(b)
+	log.Println("reading from connection")
+	n, err = c.s.Read(b)
+	if err != nil {
+		log.Println("error reading from connection", err)
+	}
+	return n, err
 }
 
 // Write writes data to the connection.
 // Write can be made to time out and return an error after a fixed
 // time limit; see SetDeadline and SetWriteDeadline.
 func (c *quicConn) Write(b []byte) (n int, err error) {
-	return c.s.Write(b)
+	log.Println("writing to connection")
+	n, err = c.s.Write(b)
+	if err != nil {
+		log.Println("error writing from connection", err)
+	}
+
+	return n, err
 }
 
 // Close closes the connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (c *quicConn) Close() error {
-	return c.s.Close()
+	log.Println("closing connection")
+	err := c.s.Close()
+
+	if err != nil {
+		log.Println("error closing from connection", err)
+	}
+
+	return err
 }
 
 // LocalAddr returns the local network address.
@@ -73,6 +92,7 @@ func (c *quicConn) RemoteAddr() net.Addr {
 //
 // A zero value for t means I/O operations will not time out.
 func (c *quicConn) SetDeadline(t time.Time) error {
+	log.Println("setting deadline", t)
 	return c.s.SetDeadline(t)
 }
 
@@ -80,6 +100,7 @@ func (c *quicConn) SetDeadline(t time.Time) error {
 // and any currently-blocked Read call.
 // A zero value for t means Read will not time out.
 func (c *quicConn) SetReadDeadline(t time.Time) error {
+	log.Println("setting read deadline", t)
 	return c.s.SetReadDeadline(t)
 }
 
@@ -89,5 +110,6 @@ func (c *quicConn) SetReadDeadline(t time.Time) error {
 // some of the data was successfully written.
 // A zero value for t means Write will not time out.
 func (c *quicConn) SetWriteDeadline(t time.Time) error {
+	log.Println("setting write deadline", t)
 	return c.s.SetWriteDeadline(t)
 }

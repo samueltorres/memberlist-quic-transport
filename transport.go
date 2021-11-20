@@ -4,22 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/memberlist"
 	"github.com/lucas-clemente/quic-go"
-)
-
-type messageType uint8
-
-const (
-	_ messageType = iota // don't use 0
-	packet
-	stream
 )
 
 type Config struct {
@@ -40,7 +32,7 @@ type Config struct {
 	TransportDebug bool
 
 	// Quic TLS Configuration
-	TLS tls.Config
+	TLS *tls.Config
 }
 
 type QuicTransport struct {
@@ -51,7 +43,9 @@ type QuicTransport struct {
 
 	listeners  []quic.Listener
 	listenerWg *sync.WaitGroup
-	shutdown   int32
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewQuicTransport(config Config) (*QuicTransport, error) {
@@ -61,12 +55,17 @@ func NewQuicTransport(config Config) (*QuicTransport, error) {
 
 	var ok bool
 	t := &QuicTransport{
-		config:     config,
-		packetCh:   make(chan *memberlist.Packet),
-		connCh:     make(chan net.Conn),
-		listeners:  make([]quic.Listener, len(config.BindAddrs)),
-		listenerWg: &sync.WaitGroup{},
+		sessionPool: newQuicSessionPool(config.TLS),
+		config:      config,
+		packetCh:    make(chan *memberlist.Packet),
+		connCh:      make(chan net.Conn),
+		listeners:   make([]quic.Listener, len(config.BindAddrs)),
+		listenerWg:  &sync.WaitGroup{},
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.cancel = cancel
+	t.ctx = ctx
 
 	defer func() {
 		if !ok {
@@ -76,7 +75,14 @@ func NewQuicTransport(config Config) (*QuicTransport, error) {
 
 	port := config.BindPort
 	for i, addr := range config.BindAddrs {
-		listener, err := quic.ListenAddr(fmt.Sprintf("%s:%d", addr, port), &config.TLS, nil)
+
+		quicConfig := &quic.Config{
+			EnableDatagrams: true,
+			KeepAlive:       true,
+			TokenStore:      quic.NewLRUTokenStore(1000, 100),
+		}
+
+		listener, err := quic.ListenAddr(fmt.Sprintf("%s:%d", addr, port), config.TLS, quicConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -88,39 +94,6 @@ func NewQuicTransport(config Config) (*QuicTransport, error) {
 
 	ok = true
 	return t, nil
-}
-
-func (t *QuicTransport) runListener(listener quic.Listener) error {
-	defer t.listenerWg.Done()
-
-	for {
-		if s := atomic.LoadInt32(&t.shutdown); s == 1 {
-			break
-		}
-
-		session, err := listener.Accept(context.Background())
-		if err != nil {
-			fmt.Println("error acception connection", err)
-			continue
-		}
-
-		stream, err := session.AcceptStream(context.Background())
-		if err != nil {
-			fmt.Println("could not accept unitstream", err)
-			continue
-		}
-
-		conn, err := newQuicConn(session, stream)
-		if err != nil {
-			fmt.Println("could not create conn", err)
-			continue
-		}
-
-		// todo: store incoming connections in pool to do a loop on receive message for the non reliable messages
-		t.connCh <- conn
-	}
-
-	return nil
 }
 
 // PacketCh returns a channel that can be read to receive incoming
@@ -204,12 +177,15 @@ func (t *QuicTransport) GetAutoBindPort() int {
 // string, similar to Dial, so it's network neutral, so this usually is
 // in the form of "host:port".
 func (t *QuicTransport) WriteTo(b []byte, addr string) (time.Time, error) {
+	log.Println("writing to", addr)
+
 	a := memberlist.Address{Addr: addr, Name: ""}
 	return t.WriteToAddress(b, a)
 }
 
 func (t *QuicTransport) WriteToAddress(b []byte, addr memberlist.Address) (time.Time, error) {
-	s, err := t.sessionPool.GetOrCreate(addr.Addr, t.config.PacketDialTimeout)
+	// log.Println("writing to address", addr.Name, addr.Addr)
+	s, err := t.sessionPool.GetOrCreate(addr, t.config.PacketDialTimeout)
 	if err != nil {
 		return time.Now(), err
 	}
@@ -230,7 +206,8 @@ func (t *QuicTransport) DialTimeout(addr string, timeout time.Duration) (net.Con
 }
 
 func (t *QuicTransport) DialAddressTimeout(addr memberlist.Address, timeout time.Duration) (net.Conn, error) {
-	session, err := t.sessionPool.GetOrCreate(addr.Addr, t.config.PacketDialTimeout)
+	log.Println("calling dialaddress", addr.Addr)
+	session, err := t.sessionPool.GetOrCreate(addr, t.config.PacketDialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -238,16 +215,13 @@ func (t *QuicTransport) DialAddressTimeout(addr memberlist.Address, timeout time
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	log.Println("opening stream")
 	stream, err := session.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := newQuicConn(session, stream)
-	if err != nil {
-		return nil, err
-	}
-
+	conn := newQuicConn(session, stream)
 	return conn, nil
 }
 
@@ -255,7 +229,7 @@ func (t *QuicTransport) DialAddressTimeout(addr memberlist.Address, timeout time
 // transport a chance to clean up any listeners.
 func (t *QuicTransport) Shutdown() error {
 	// This will avoid log spam about errors when we shut down.
-	atomic.StoreInt32(&t.shutdown, 1)
+	t.cancel()
 
 	// Rip through all the connections and shut them down.
 	for _, conn := range t.listeners {
@@ -265,4 +239,76 @@ func (t *QuicTransport) Shutdown() error {
 	// Block until all the listener threads have died.
 	t.listenerWg.Wait()
 	return nil
+}
+
+func (t *QuicTransport) runListener(listener quic.Listener) error {
+	defer t.listenerWg.Done()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return nil
+		default:
+		}
+
+		session, err := listener.Accept(context.Background())
+		if err != nil {
+			log.Println("error acception connection", err)
+			continue
+		}
+
+		log.Println("accepted connection from ", session.RemoteAddr())
+
+		t.listenerWg.Add(2)
+		go t.handleStream(session)
+		go t.handleDatagrams(session)
+	}
+}
+
+func (t *QuicTransport) handleStream(session quic.Session) {
+	defer t.listenerWg.Done()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		default:
+		}
+
+		stream, err := session.AcceptStream(t.ctx)
+		if err != nil {
+			log.Println("could not accept unitstream", err)
+			return
+		}
+
+		conn := newQuicConn(session, stream)
+		t.connCh <- conn
+	}
+}
+
+func (t *QuicTransport) handleDatagrams(session quic.Session) {
+	defer t.listenerWg.Done()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		default:
+		}
+
+		msg, err := session.ReceiveMessage()
+		if err != nil {
+			log.Println("error receiving datagram :", err)
+			return
+		}
+
+		if len(msg) < 1 {
+			log.Println("empty datagram")
+		}
+
+		t.packetCh <- &memberlist.Packet{
+			Buf:       msg,
+			From:      session.RemoteAddr(),
+			Timestamp: time.Now(),
+		}
+	}
 }
